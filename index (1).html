@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OptiMath PLC Pro - Programación Lineal Continua</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}
+input,select{outline:none}
+.math{font-family:Georgia,'Times New Roman',serif}
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+const {useState,useEffect,useMemo}=React;
+const EPS=1e-8;
+
+const fmt=(x,d=4)=>{
+  if(!Number.isFinite(x)) return '—';
+  const v=Math.abs(x)<1e-9?0:x;
+  return Number(v).toFixed(d).replace(/\.?0+$/,'');
+};
+
+function App(){
+  const [numVars,setNumVars]=useState(3);
+  const [numRestricciones,setNumRestricciones]=useState(3);
+  const [tipoObjetivo,setTipoObjetivo]=useState('MAX');
+  const [variables,setVariables]=useState([
+    {id:1,nombre:'X1',cj:3,noNegativa:true},
+    {id:2,nombre:'X2',cj:2,noNegativa:true},
+    {id:3,nombre:'X3',cj:5,noNegativa:true}
+  ]);
+  const [restricciones,setRestricciones]=useState([
+    {id:1,coefs:[2,1,1],tipo:'<=',bi:10},
+    {id:2,coefs:[1,2,3],tipo:'<=',bi:15},
+    {id:3,coefs:[0,1,2],tipo:'<=',bi:8}
+  ]);
+  const [resultado,setResultado]=useState(null);
+  const [auto,setAuto]=useState(true);
+
+  useEffect(()=>{
+    setVariables(old=>{
+      const v=old.slice(0,numVars);
+      while(v.length<numVars)v.push({id:v.length+1,nombre:`X${v.length+1}`,cj:0,noNegativa:true});
+      return v.map((x,i)=>({...x,id:i+1}));
+    });
+    setRestricciones(old=>{
+      const r=old.slice(0,numRestricciones).map((x,i)=>{
+        const c=(x.coefs||[]).slice(0,numVars);
+        while(c.length<numVars)c.push(0);
+        return {...x,id:i+1,coefs:c};
+      });
+      while(r.length<numRestricciones)r.push({
+        id:r.length+1,coefs:Array(numVars).fill(0),tipo:'<=',bi:0
+      });
+      return r;
+    });
+  },[numVars,numRestricciones]);
+
+  useEffect(()=>{
+    if(auto) resolver();
+  },[variables,restricciones,tipoObjetivo,auto]);
+
+  const changeVar=(i,key,val)=>{
+    setVariables(a=>a.map((v,k)=>k===i?{...v,[key]:key==='nombre'?val:(key==='noNegativa'?val:(parseFloat(val)||0))}:v));
+  };
+  const changeCoef=(ri,vi,val)=>{
+    setRestricciones(a=>a.map((r,k)=>k===ri?{...r,coefs:r.coefs.map((c,j)=>j===vi?(parseFloat(val)||0):c)}:r));
+  };
+  const changeR=(ri,key,val)=>{
+    setRestricciones(a=>a.map((r,k)=>k===ri?{...r,[key]:key==='bi'?(parseFloat(val)||0):val}:r));
+  };
+
+  const modelString=()=>{
+    const terms=variables.map((v,i)=>{
+      const c=Number(v.cj)||0;
+      if(i===0)return `${c<0?'− ':''}${fmt(Math.abs(c))}${v.nombre}`;
+      return `${c<0?' − ':' + '}${fmt(Math.abs(c))}${v.nombre}`;
+    }).join('');
+    return `${tipoObjetivo==='MAX'?'Max':'Min'} F(x) = ${terms}`;
+  };
+
+  const constraintString=r=>variables.map((v,i)=>{
+    const c=Number(r.coefs[i])||0;
+    if(i===0)return `${c<0?'− ':''}${fmt(Math.abs(c))}${v.nombre}`;
+    return `${c<0?' − ':' + '}${fmt(Math.abs(c))}${v.nombre}`;
+  }).join('');
+
+  /*
+   * MOTOR INTERNO
+   * El algoritmo utiliza una representación auxiliar únicamente para calcular.
+   * Esa representación no se muestra en la interfaz.
+   */
+  function solveLP(){
+    const origN=variables.length, m=restricciones.length;
+    if(!origN||!m)return {estado:'error',mensaje:'El modelo necesita variables y restricciones.'};
+
+    // Transformación interna de variables: X libre = X+ - X-
+    const map=[];
+    const internalNames=[];
+    const c=[];
+    variables.forEach((v,i)=>{
+      if(v.noNegativa){
+        map.push([{col:internalNames.length,sign:1}]);
+        internalNames.push(v.nombre);
+        c.push(Number(v.cj)||0);
+      }else{
+        const p=internalNames.length;
+        internalNames.push(`${v.nombre}+`); c.push(Number(v.cj)||0);
+        const q=internalNames.length;
+        internalNames.push(`${v.nombre}-`); c.push(-(Number(v.cj)||0));
+        map.push([{col:p,sign:1},{col:q,sign:-1}]);
+      }
+    });
+
+    const n=internalNames.length;
+    let rows=restricciones.map(r=>({a:Array(n).fill(0),tipo:r.tipo,b:Number(r.bi)||0}));
+    restricciones.forEach((r,i)=>{
+      variables.forEach((v,j)=>{
+        const a=Number(r.coefs[j])||0;
+        map[j].forEach(z=>rows[i].a[z.col]+=a*z.sign);
+      });
+    });
+
+    // RHS negativo: se cambia el sentido de la desigualdad.
+    rows.forEach(r=>{
+      if(r.b < -EPS){
+        r.a=r.a.map(x=>-x); r.b=-r.b;
+        if(r.tipo==='<=')r.tipo='>=';
+        else if(r.tipo==='>=')r.tipo='<=';
+      }
+    });
+
+    let slack=0,surplus=0,art=0;
+    rows.forEach(r=>{
+      if(r.tipo==='<=')slack++;
+      else if(r.tipo==='>='){surplus++;art++;}
+      else art++;
+    });
+
+    const total=n+slack+surplus+art, rhs=total;
+    const T=Array.from({length:m+1},()=>Array(total+1).fill(0));
+    const basis=Array(m).fill(-1);
+    const artificialCols=new Set();
+    const usableCols=new Set(Array.from({length:n+slack+surplus},(_,i)=>i));
+    let s=0,e=0,a=0;
+
+    rows.forEach((r,i)=>{
+      for(let j=0;j<n;j++)T[i][j]=r.a[j];
+      if(r.tipo==='<='){
+        T[i][n+s]=1; basis[i]=n+s; s++;
+      }else if(r.tipo==='>='){
+        T[i][n+slack+e]=-1;
+        T[i][n+slack+surplus+a]=1;
+        basis[i]=n+slack+surplus+a;
+        artificialCols.add(basis[i]); e++;a++;
+      }else{
+        T[i][n+slack+surplus+a]=1;
+        basis[i]=n+slack+surplus+a;
+        artificialCols.add(basis[i]); a++;
+      }
+      T[i][rhs]=r.b;
+    });
+
+    const snapshots=[];
+    const cleanTable=phase=>{
+      return {
+        phase,
+        basis:basis.map(x=>x>=0?internalNames.concat(
+          Array.from({length:slack},(_,i)=>`s${i+1}`),
+          Array.from({length:surplus},(_,i)=>`e${i+1}`),
+          Array.from({length:art},(_,i)=>`a${i+1}`)
+        )[x]:'—'),
+        columns:internalNames.concat(
+          Array.from({length:slack},(_,i)=>`s${i+1}`),
+          Array.from({length:surplus},(_,i)=>`e${i+1}`),
+          Array.from({length:art},(_,i)=>`a${i+1}`)
+        ),
+        rows:T.map(r=>r.map((x,j)=>j===rhs?x:x))
+      };
+    };
+
+    function pivot(pr,pc){
+      const p=T[pr][pc];
+      if(Math.abs(p)<EPS)return false;
+      for(let j=0;j<=total;j++)T[pr][j]/=p;
+      for(let i=0;i<=m;i++){
+        if(i===pr)continue;
+        const f=T[i][pc];
+        if(Math.abs(f)<EPS)continue;
+        for(let j=0;j<=total;j++)T[i][j]-=f*T[pr][j];
+      }
+      basis[pr]=pc;
+      return true;
+    }
+
+    function run(phase,allowed){
+      let it=0;
+      while(it++<500){
+        let enter=-1;
+        for(let j=0;j<total;j++){
+          if(!allowed.has(j))continue;
+          if(T[m][j]<-EPS){enter=j;break;}
+        }
+        if(enter<0)return {ok:true,iterations:it-1};
+        let leave=-1,best=Infinity;
+        for(let i=0;i<m;i++){
+          if(T[i][enter]>EPS){
+            const ratio=T[i][rhs]/T[i][enter];
+            if(ratio<best-EPS || (Math.abs(ratio-best)<=EPS && (leave<0||i<leave))){
+              best=ratio;leave=i;
+            }
+          }
+        }
+        if(leave<0)return {ok:false,unbounded:true,iterations:it-1};
+        const entering=enter,leaving=basis[leave],pivotValue=T[leave][enter];
+        if(snapshots.length<80){
+          snapshots.push({phase,iteration:snapshots.length+1,entering,leaving,row:leave,col:enter,pivot:pivotValue,table:cleanTable(phase)});
+        }
+        pivot(leave,enter);
+      }
+      return {ok:false,limit:true};
+    }
+
+    // Fase I: maximizar el negativo de la suma de los valores artificiales.
+    if(art>0){
+      for(let j=0;j<=total;j++)T[m][j]=0;
+      artificialCols.forEach(col=>{
+        T[m][col]=-1;
+      });
+      // Hacer canónica la fila objetivo.
+      for(let i=0;i<m;i++){
+        if(artificialCols.has(basis[i])){
+          for(let j=0;j<=total;j++)T[m][j]+=T[i][j];
+        }
+      }
+      const p1=run(1,usableCols);
+      if(!p1.ok&&p1.unbounded)return {estado:'no_factible',mensaje:'No se ha podido obtener una solución factible.',snapshots};
+      const phase1Value=T[m][rhs];
+      if(phase1Value < -1e-6){
+        return {estado:'no_factible',mensaje:'El modelo no presenta una solución factible.',snapshots};
+      }
+      // Sacar variables internas de la base cuando exista una columna utilizable.
+      for(let i=0;i<m;i++){
+        if(artificialCols.has(basis[i])){
+          let col=-1;
+          for(let j=0;j<n+slack+surplus;j++){
+            if(Math.abs(T[i][j])>EPS){col=j;break;}
+          }
+          if(col>=0)pivot(i,col);
+        }
+      }
+    }
+
+    // Fase II.
+    for(let j=0;j<=total;j++)T[m][j]=0;
+    for(let j=0;j<n;j++){
+      const cj=Number(c[j])||0;
+      T[m][j]=tipoObjetivo==='MAX'?-cj:cj;
+    }
+    // Canonizar objetivo respecto a la base.
+    for(let i=0;i<m;i++){
+      const bcol=basis[i];
+      if(bcol>=0 && bcol<n){
+        const f=T[m][bcol];
+        if(Math.abs(f)>EPS)for(let j=0;j<=total;j++)T[m][j]-=f*T[i][j];
+      }
+    }
+
+    const p2=run(2,usableCols);
+    if(!p2.ok&&p2.unbounded)return {estado:'no_acotado',mensaje:'El modelo es no acotado.',snapshots};
+    if(!p2.ok)return {estado:'error',mensaje:'El algoritmo ha alcanzado el límite de iteraciones.',snapshots};
+
+    const x=Array(n).fill(0);
+    for(let i=0;i<m;i++)if(basis[i]>=0&&basis[i]<n)x[basis[i]]=Math.abs(T[i][rhs])<EPS?0:T[i][rhs];
+
+    const originalValues=variables.map((v,i)=>{
+      let val=0;
+      map[i].forEach(z=>val+=z.sign*x[z.col]);
+      return Math.abs(val)<EPS?0:val;
+    });
+    const objective=originalValues.reduce((sum,v,i)=>sum+v*(Number(variables[i].cj)||0),0);
+
+    // Detectar óptimos alternativos: una variable no básica original con coste reducido ~ 0.
+    let multiple=false;
+    for(let j=0;j<n;j++){
+      const basic=basis.includes(j);
+      if(!basic && Math.abs(T[m][j])<=1e-7){multiple=true;break;}
+    }
+
+    const estados=restricciones.map(r=>{
+      const val=r.coefs.reduce((s,a,j)=>s+a*originalValues[j],0);
+      let cumple=r.tipo==='<='?val<=r.bi+1e-6:r.tipo==='>='?val>=r.bi-1e-6:Math.abs(val-r.bi)<=1e-6;
+      return {calculado:val,bi:r.bi,cumple,activa:Math.abs(val-r.bi)<=1e-6};
+    });
+
+    return {
+      estado:'optimo',valores:originalValues,objetivo,estados,multiple,
+      snapshots,internalTable:cleanTable(2),iterations:snapshots.length
+    };
+  }
+
+  function resolver(){
+    try{setResultado(solveLP());}
+    catch(err){setResultado({estado:'error',mensaje:'No se ha podido resolver el modelo. Comprueba los datos introducidos.'});}
+  }
+
+  return <div className="min-h-screen">
+    <header className="bg-emerald-600 text-white shadow-lg">
+      <div className="max-w-7xl mx-auto px-5 py-6">
+        <h1 className="text-3xl md:text-4xl font-bold">OptiMath PLC Pro</h1>
+        <p className="text-emerald-50 mt-1">Programación Lineal Continua · Formulación, resolución e interpretación</p>
+      </div>
+    </header>
+
+    <main className="max-w-7xl mx-auto px-5 py-7 space-y-6">
+
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <div className="flex items-center justify-between gap-4 mb-5">
+          <h2 className="text-2xl font-bold text-emerald-700">1. Definición</h2>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={auto} onChange={e=>setAuto(e.target.checked)}/>
+            Resolver automáticamente
+          </label>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-4 mb-6">
+          <label className="font-semibold">Número de variables
+            <input className="block mt-1 w-full border rounded-lg px-3 py-2" type="number" min="1" max="20"
+              value={numVars} onChange={e=>setNumVars(Math.max(1,Math.min(20,Number(e.target.value)||1)))}/>
+          </label>
+          <label className="font-semibold">Número de restricciones
+            <input className="block mt-1 w-full border rounded-lg px-3 py-2" type="number" min="1" max="30"
+              value={numRestricciones} onChange={e=>setNumRestricciones(Math.max(1,Math.min(30,Number(e.target.value)||1)))}/>
+          </label>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="bg-slate-100">
+              <th className="p-3 text-left">Variable de decisión</th><th className="p-3 text-left">Nombre</th>
+              <th className="p-3 text-left">cj</th><th className="p-3 text-left">Condición</th>
+            </tr></thead>
+            <tbody>{variables.map((v,i)=><tr className="border-b" key={v.id}>
+              <td className="p-3 font-semibold">X{i+1}</td>
+              <td className="p-3"><input className="border rounded-lg px-2 py-1 w-28" value={v.nombre}
+                onChange={e=>changeVar(i,'nombre',e.target.value)}/></td>
+              <td className="p-3"><input className="border rounded-lg px-2 py-1 w-24" type="number" step="any" value={v.cj}
+                onChange={e=>changeVar(i,'cj',e.target.value)}/></td>
+              <td className="p-3"><label className="flex gap-2 items-center">
+                <input type="checkbox" checked={v.noNegativa} onChange={e=>changeVar(i,'noNegativa',e.target.checked)}/>
+                {v.nombre} ≥ 0
+              </label></td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <h2 className="text-2xl font-bold text-emerald-700 mb-5">2. Parte de modelado</h2>
+        <div className="flex flex-wrap items-center gap-3 mb-5">
+          <span className="font-semibold">Función objetivo:</span>
+          <select className="border rounded-lg px-3 py-2" value={tipoObjetivo} onChange={e=>setTipoObjetivo(e.target.value)}>
+            <option value="MAX">Maximizar</option><option value="MIN">Minimizar</option>
+          </select>
+        </div>
+        <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-4 mb-6 overflow-x-auto math text-lg">
+          {modelString()}
+        </div>
+        <h3 className="text-xl font-bold mb-3">Restricciones</h3>
+        <div className="space-y-3">
+          {restricciones.map((r,ri)=><div key={r.id} className="flex flex-wrap items-center gap-2 bg-slate-50 p-3 rounded-xl">
+            {variables.map((v,vi)=><React.Fragment key={v.id}>
+              <input className="border rounded-lg px-2 py-1 w-20" type="number" step="any"
+                value={r.coefs[vi]??0} onChange={e=>changeCoef(ri,vi,e.target.value)}/>
+              <span className="math">{v.nombre}</span>
+              {vi<variables.length-1&&<span>+</span>}
+            </React.Fragment>)}
+            <select className="border rounded-lg px-3 py-1" value={r.tipo} onChange={e=>changeR(ri,'tipo',e.target.value)}>
+              <option value="<=">≤</option><option value=">=">≥</option><option value="=">=</option>
+            </select>
+            <input className="border rounded-lg px-2 py-1 w-24" type="number" step="any" value={r.bi}
+              onChange={e=>changeR(ri,'bi',e.target.value)}/>
+            <span className="text-slate-500">R{ri+1}</span>
+          </div>)}
+        </div>
+      </section>
+
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <h2 className="text-2xl font-bold text-emerald-700 mb-5">3. Modelo matemático</h2>
+        <div className="bg-slate-900 text-white rounded-xl p-5 overflow-x-auto math text-lg">
+          <div>{modelString()}</div><div className="mt-3">s.a.</div>
+          {restricciones.map((r,i)=><div key={r.id}>{constraintString(r)} {r.tipo} {fmt(r.bi)} <span className="text-slate-400"> (R{i+1})</span></div>)}
+          <div className="mt-3">{variables.filter(v=>v.noNegativa).map(v=><span className="mr-5" key={v.id}>{v.nombre} ≥ 0</span>)}</div>
+        </div>
+      </section>
+
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <div className="flex flex-wrap justify-between items-center gap-3 mb-5">
+          <h2 className="text-2xl font-bold text-emerald-700">4. Resolución</h2>
+          <button onClick={resolver} className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-5 py-2.5 rounded-lg">
+            Resolver
+          </button>
+        </div>
+
+        {resultado?.estado==='optimo'&&<>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {variables.map((v,i)=><div key={v.id} className="rounded-xl bg-emerald-50 border border-emerald-100 p-5">
+              <div className="text-slate-500">{v.nombre}</div><div className="text-3xl font-bold text-emerald-700">{fmt(resultado.valores[i])}</div>
+            </div>)}
+            <div className="rounded-xl bg-slate-900 text-white p-5">
+              <div className="text-slate-300">Valor óptimo F(x)</div><div className="text-3xl font-bold">{fmt(resultado.objetivo)}</div>
+            </div>
+          </div>
+          {resultado.multiple&&<div className="mt-4 p-4 rounded-xl bg-blue-50 border border-blue-200 text-blue-800">
+            Se ha detectado la posibilidad de múltiples soluciones óptimas.
+          </div>}
+          <div className="mt-6 overflow-x-auto">
+            <h3 className="text-xl font-bold mb-3">Estado de las restricciones</h3>
+            <table className="w-full text-sm">
+              <thead><tr className="bg-slate-100">
+                <th className="p-3 text-left">Restricción</th><th className="p-3 text-left">Valor calculado</th>
+                <th className="p-3 text-left">bi</th><th className="p-3 text-left">Cumple</th><th className="p-3 text-left">Estado</th>
+              </tr></thead>
+              <tbody>{resultado.estados.map((e,i)=><tr key={i} className="border-b">
+                <td className="p-3">R{i+1}</td><td className="p-3">{fmt(e.calculado)}</td><td className="p-3">{fmt(e.bi)}</td>
+                <td className="p-3">{e.cumple?'Sí':'No'}</td><td className="p-3 font-semibold">{e.activa?'Activa':'No activa'}</td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        </>}
+
+        {resultado?.estado==='no_factible'&&<div className="p-5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800">
+          <b>Modelo no factible.</b><div>{resultado.mensaje}</div>
+        </div>}
+        {resultado?.estado==='no_acotado'&&<div className="p-5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800">
+          <b>Modelo no acotado.</b><div>{resultado.mensaje}</div>
+        </div>}
+        {resultado?.estado==='error'&&<div className="p-5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800">
+          <b>Error de resolución.</b><div>{resultado.mensaje}</div>
+        </div>}
+        {!resultado&&<p className="text-slate-500">Pulsa «Resolver» para obtener la solución.</p>}
+      </section>
+
+      {resultado?.estado==='optimo'&&resultado.snapshots?.length>0&&
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <h2 className="text-2xl font-bold text-emerald-700 mb-2">5. Proceso de resolución</h2>
+        <p className="text-slate-600 mb-5">
+          Se muestran las iteraciones utilizadas internamente por el método de resolución. Las tablas son una herramienta de seguimiento del cálculo.
+        </p>
+        <div className="space-y-5">
+          {resultado.snapshots.slice(-12).map((s,k)=>{
+            const cols=s.table.columns;
+            return <details key={k} className="border rounded-xl overflow-hidden">
+              <summary className="cursor-pointer bg-slate-50 p-4 font-semibold">
+                Fase {s.phase} · Iteración {s.iteration} · Entrada: {s.table.columns[s.col]} · Salida: fila {s.row+1} · Pivote: {fmt(s.pivot)}
+              </summary>
+              <div className="overflow-x-auto p-3">
+                <table className="text-xs border-collapse">
+                  <thead><tr><th className="border p-2 bg-slate-100">Base</th>
+                    {cols.map(c=><th className="border p-2 bg-slate-100" key={c}>{c}</th>)}<th className="border p-2 bg-slate-100">b</th></tr></thead>
+                  <tbody>{s.table.rows.map((row,i)=><tr key={i}>
+                    <td className="border p-2 font-semibold">{i<s.table.basis.length?s.table.basis[i]:'F(x)'}</td>
+                    {row.map((x,j)=><td className="border p-2 text-right" key={j}>{fmt(x)}</td>)}
+                  </tr>)}</tbody>
+                </table>
+              </div>
+            </details>
+          })}
+        </div>
+      </section>}
+
+      {numVars===2&&resultado?.estado==='optimo'&&
+        <Graph variables={variables} restricciones={restricciones} resultado={resultado}/>
+      }
+
+      <section className="bg-white rounded-2xl shadow-sm border p-6">
+        <h2 className="text-2xl font-bold text-emerald-700 mb-3">Interpretación de la solución</h2>
+        {resultado?.estado==='optimo'?
+          <p className="text-slate-600 leading-relaxed">
+            La solución encontrada indica los valores de las variables de decisión que optimizan la función objetivo
+            respetando las restricciones del modelo. Una restricción aparece como activa cuando la solución se sitúa
+            sobre su límite.
+          </p>:
+          <p className="text-slate-600">Resuelve el modelo para mostrar su interpretación.</p>}
+      </section>
+    </main>
+
+    <footer className="text-center text-slate-500 py-8">OptiMath PLC Pro · Programación Lineal Continua</footer>
+  </div>
+}
+
+function Graph({variables,restricciones,resultado}){
+  const W=760,H=470,pad=58;
+  const pts=[];
+  const lines=[];
+
+  // Intersecciones de pares de fronteras, incluyendo ejes por no negatividad.
+  const cons=restricciones.map((r,i)=>({a:r.coefs[0],b:r.coefs[1],c:r.bi,type:r.tipo,name:`R${i+1}`}));
+  cons.push({a:1,b:0,c:0,type:'>=',name:'X1≥0'});
+  cons.push({a:0,b:1,c:0,type:'>=',name:'X2≥0'});
+
+  function intersect(c1,c2){
+    const d=c1.a*c2.b-c2.a*c1.b;
+    if(Math.abs(d)<EPS)return null;
+    return {
+      x:(c1.c*c2.b-c2.c*c1.b)/d,
+      y:(c1.a*c2.c-c2.a*c1.c)/d
+    };
+  }
+  function feasible(x,y){
+    if(!Number.isFinite(x)||!Number.isFinite(y))return false;
+    return restricciones.every(r=>{
+      const v=r.coefs[0]*x+r.coefs[1]*y;
+      return r.tipo==='<= '?v<=r.bi+1e-6:r.tipo==='<= '?v<=r.bi+1e-6:r.tipo==='>='?v>=r.bi-1e-6:Math.abs(v-r.bi)<=1e-6;
+    }) && variables[0].noNegativa? x>=-1e-6 : true;
+  }
+  // Corrección explícita para condiciones de ambas variables.
+  function isFeasible(x,y){
+    if(variables[0].noNegativa&&x<-1e-7)return false;
+    if(variables[1].noNegativa&&y<-1e-7)return false;
+    for(const r of restricciones){
+      const v=r.coefs[0]*x+r.coefs[1]*y;
+      if(r.tipo==='<='&&v>r.bi+1e-6)return false;
+      if(r.tipo==='>='&&v<r.bi-1e-6)return false;
+      if(r.tipo==='='&&Math.abs(v-r.bi)>1e-6)return false;
+    }
+    return true;
+  }
+  for(let i=0;i<cons.length;i++)for(let j=i+1;j<cons.length;j++){
+    const q=intersect(cons[i],cons[j]);
+    if(q&&isFeasible(q.x,q.y))pts.push(q);
+  }
+  const opt={x:resultado.valores[0],y:resultado.valores[1]};
+  pts.push(opt);
+  const unique=[];
+  pts.forEach(p=>{if(!unique.some(q=>Math.hypot(q.x-p.x,q.y-p.y)<1e-6))unique.push(p)});
+
+  let maxX=Math.max(1,...unique.map(p=>Math.abs(p.x)),...restricciones.map(r=>Math.abs(r.bi/(r.coefs[0]||1))));
+  let maxY=Math.max(1,...unique.map(p=>Math.abs(p.y)),...restricciones.map(r=>Math.abs(r.bi/(r.coefs[1]||1))));
+  maxX=Math.max(5,maxX*1.2);maxY=Math.max(5,maxY*1.2);
+  const minX=variables[0].noNegativa?0:-maxX*.25;
+  const minY=variables[1].noNegativa?0:-maxY*.25;
+  const sx=x=>pad+(x-minX)/(maxX-minX)*(W-2*pad);
+  const sy=y=>H-pad-(y-minY)/(maxY-minY)*(H-2*pad);
+
+  // Región factible mediante clipping de un polígono inicial.
+  let poly=[[minX,minY],[maxX,minY],[maxX,maxY],[minX,maxY]];
+  const clip=(poly,r)=>{
+    const f=(p)=>{
+      const v=r.coefs[0]*p[0]+r.coefs[1]*p[1]-r.bi;
+      return r.tipo==='>='?-v:v;
+    };
+    if(r.tipo==='='){
+      // Para igualdad se conserva la intersección aproximada con ambos lados.
+      return poly.filter(p=>Math.abs(f(p))<1e-6);
+    }
+    const out=[];
+    for(let i=0;i<poly.length;i++){
+      const A=poly[i],B=poly[(i+1)%poly.length],fa=f(A),fb=f(B);
+      const ina=fa<=1e-9,inb=fb<=1e-9;
+      if(ina)out.push(A);
+      if(ina!==inb){
+        const t=fa/(fa-fb);
+        out.push([A[0]+t*(B[0]-A[0]),A[1]+t*(B[1]-A[1])]);
+      }
+    }
+    return out;
+  };
+  for(const r of restricciones)poly=clip(poly,r);
+  if(variables[0].noNegativa)poly=clip(poly,{coefs:[-1,0],bi:0,tipo:'<='});
+  if(variables[1].noNegativa)poly=clip(poly,{coefs:[0,-1],bi:0,tipo:'<='});
+
+  const polyPts=poly.map(p=>`${sx(p[0])},${sy(p[1])}`).join(' ');
+
+  function lineEnds(r){
+    const a=r.coefs[0],b=r.coefs[1],c=r.bi;
+    const q=[];
+    if(Math.abs(b)>EPS){q.push([minX,(c-a*minX)/b],[maxX,(c-a*maxX)/b]);}
+    else if(Math.abs(a)>EPS){const x=c/a;q.push([x,minY],[x,maxY]);}
+    return q;
+  }
+
+  return <section className="bg-white rounded-2xl shadow-sm border p-6">
+    <h2 className="text-2xl font-bold text-emerald-700 mb-2">6. Representación gráfica</h2>
+    <p className="text-slate-600 mb-4">Como el modelo tiene exactamente dos variables, se muestra su representación en el plano.</p>
+    <div className="overflow-x-auto">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full min-w-[650px] bg-slate-50 rounded-xl border">
+        {Array.from({length:9},(_,i)=>{
+          const x=minX+(maxX-minX)*i/8;
+          return <line key={'gx'+i} x1={sx(x)} y1={pad} x2={sx(x)} y2={H-pad} stroke="#dbe3ea"/>})}
+        {Array.from({length:7},(_,i)=>{
+          const y=minY+(maxY-minY)*i/6;
+          return <line key={'gy'+i} x1={pad} y1={sy(y)} x2={W-pad} y2={sy(y)} stroke="#dbe3ea"/>})}
+        <polygon points={polyPts} fill="rgba(16,185,129,.18)" stroke="none"/>
+        <line x1={sx(0)} y1={pad} x2={sx(0)} y2={H-pad} stroke="#334155" strokeWidth="2"/>
+        <line x1={pad} y1={sy(0)} x2={W-pad} y2={sy(0)} stroke="#334155" strokeWidth="2"/>
+        {restricciones.map((r,i)=>{
+          const e=lineEnds(r);
+          if(e.length<2)return null;
+          return <g key={i}>
+            <line x1={sx(e[0][0])} y1={sy(e[0][1])} x2={sx(e[1][0])} y2={sy(e[1][1])}
+              stroke="#64748b" strokeWidth="2"/>
+            <text x={sx(e[0][0])+5} y={sy(e[0][1])-5} fontSize="13">R{i+1}</text>
+          </g>
+        })}
+        <circle cx={sx(opt.x)} cy={sy(opt.y)} r="7" fill="#059669" stroke="white" strokeWidth="3"/>
+        <text x={sx(opt.x)+10} y={sy(opt.y)-10} fontWeight="700" fontSize="14">
+          Óptimo ({fmt(opt.x)}, {fmt(opt.y)})
+        </text>
+        <text x={W-45} y={sy(0)-10} fontWeight="700">X1</text>
+        <text x={sx(0)+8} y={25} fontWeight="700">X2</text>
+      </svg>
+    </div>
+    <div className="mt-4 p-4 bg-slate-50 rounded-xl">
+      <b>Región factible:</b> zona que satisface simultáneamente todas las restricciones y las condiciones de las variables.
+      <br/><b>Punto óptimo:</b> ({fmt(opt.x)}, {fmt(opt.y)}), con F(x) = {fmt(resultado.objetivo)}.
+    </div>
+  </section>
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
